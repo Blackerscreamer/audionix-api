@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 // HIER deine Dropbox App Keys eintragen
 const CLIENT_ID = "1w0y4rdnuvbe476";
 const CLIENT_SECRET = "je5paqlcai1vxhc";
-const REDIRECT_URI = "https://audionix-e7qy.onrender.com/auth";
+const REDIRECT_URI = "https://audionix-api-ex4b.onrender.com";
 
 // 1. Startseite mit Login-Link
 app.get("/", (req, res) => {
