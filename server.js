@@ -1,59 +1,270 @@
 // server.js
-// server.js (ES module style)
-import express from "express";
-import axios from "axios";
-import bodyParser from "body-parser";
+import express from 'express';
+import multer from 'multer';
+import { Dropbox } from 'dropbox';
+import fetch from 'node-fetch';
+import cors from 'cors';
+import axios from 'axios';
 
 const app = express();
-app.use(bodyParser.json());
+const port = 3000; // fest gesetzt, kannst du ändern
 
-const PORT = process.env.PORT || 3000;
+// Middlewares
+app.use(cors({ origin: '*' }));
+app.use(express.json()); // für DELETE body parsing etc.
 
-// HIER deine Dropbox App Keys eintragen
-const CLIENT_ID = "1w0y4rdnuvbe476";
-const CLIENT_SECRET = "je5paqlcai1vxhc";
-const REDIRECT_URI = "https://audionix-api-ex4b.onrender.com/auth";
+// Multer (in-memory)
+const upload = multer({ storage: multer.memoryStorage() });
 
-// 1. Startseite mit Login-Link
-app.get("/", (req, res) => {
-  const authUrl = `https://www.dropbox.com/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(
-    REDIRECT_URI
-  )}&token_access_type=offline`;
-  res.send(`<a href="${authUrl}">Mit Dropbox verbinden</a>`);
-});
+// ---------- HARDCODED KONFIGURATION (OHNE ENV) ----------
+const CLIENT_ID = '1w0y4rdnuvbe476';
+const CLIENT_SECRET = 'je5paqlcai1vxhc';
+// Bitte hier deinen manuell geholtener Refresh-Token einsetzen:
+const REFRESH_TOKEN = 'L4N3aNJBnM8AAAAAAAAAAX9jprkmTjHaduGuaKzGxtnODQ5UhEzEUIvgUFXQ3uop';
 
-// 2. Dropbox schickt dich hierher zurück
-app.get("/auth", async (req, res) => {
-  const code = req.query.code;
-  if (!code) return res.send("Kein Code erhalten!");
+// Interner Zustand
+let ACCESS_TOKEN = null;
+let dbx = null;
+
+// ---------- HILFSFUNKTIONEN ----------
+function sanitizeFilename(name) {
+  return name.replace(/[^\w\d_\-\.() ]/g, '_').slice(0, 200);
+}
+
+async function createOrUpdateDbx(token) {
+  dbx = new Dropbox({ accessToken: token, fetch });
+}
+
+// Funktion, um Access Token automatisch zu erneuern
+async function refreshAccessToken() {
+  if (!REFRESH_TOKEN || REFRESH_TOKEN === 'DEIN_MANUELL_GEHOLTENER_REFRESH_TOKEN') {
+    console.warn('Kein gültiger REFRESH_TOKEN gesetzt. Ersetze den Platzhalter in server.js durch deinen tatsächlichen Refresh-Token.');
+    return;
+  }
 
   try {
-    // Code gegen Token austauschen
-    const response = await axios.post(
-      "https://api.dropbox.com/oauth2/token",
-      new URLSearchParams({
-        code,
-        grant_type: "authorization_code",
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        redirect_uri: REDIRECT_URI,
-      }),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-    );
+    const params = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: REFRESH_TOKEN,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET
+    });
 
-    const data = response.data;
-    res.send(`
-      <h1>Dropbox Tokens</h1>
-      <p><b>Access Token (kurzlebig):</b> ${data.access_token}</p>
-      <p><b>Refresh Token (lange gültig):</b> ${data.refresh_token}</p>
-      <p><b>Token Type:</b> ${data.token_type}</p>
-      <p><b>Expires In:</b> ${data.expires_in} Sekunden</p>
-    `);
+    const response = await axios.post('https://api.dropbox.com/oauth2/token', params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+
+    const token = response.data.access_token;
+    const expiresIn = response.data.expires_in;
+
+    if (!token) {
+      console.error('Kein access_token in der Antwort gefunden:', response.data);
+      return;
+    }
+
+    ACCESS_TOKEN = token;
+    await createOrUpdateDbx(ACCESS_TOKEN);
+
+    console.log('Neuer Access Token erhalten (gültig für', expiresIn, 'Sekunden).');
   } catch (err) {
-    res.send("Fehler beim Token-Austausch: " + err.message);
+    console.error('Fehler beim Refreshen des Tokens:', err?.response?.data || err.message || err);
   }
-});
+}
 
-app.listen(PORT, () => {
-  console.log(`Server läuft auf Port ${PORT}`);
-});
+// ---------- START: Token holen, dann Server starten ----------
+(async () => {
+  await refreshAccessToken();
+
+  // Interval zum erneuern: ca. 3.5 Stunden (Dropbox tokens ~4h)
+  const REFRESH_INTERVAL_MS = 12600 * 1000;
+  setInterval(refreshAccessToken, REFRESH_INTERVAL_MS);
+
+  // ---------- ENDPOINTS ----------
+  app.get('/', (req, res) => res.send('Dropbox Backend (ohne env) läuft ✅'));
+
+  // Upload endpoint: mp3 file + coverBase64 + songName + artist
+  app.post('/upload', upload.single('file'), async (req, res) => {
+    try {
+      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
+
+      const mp3 = req.file;
+      const { coverBase64, songName, artist } = req.body || {};
+
+      if (!mp3) return res.status(400).json({ error: 'Keine Datei hochgeladen (field "file")' });
+
+      const isMp3Mime = (mp3.mimetype === 'audio/mpeg' || mp3.mimetype === 'audio/mp3');
+      const isMp3Ext = mp3.originalname.toLowerCase().endsWith('.mp3');
+      if (!isMp3Mime && !isMp3Ext) {
+        return res.status(400).json({ error: 'Nur MP3-Dateien erlaubt' });
+      }
+
+      if (!coverBase64) return res.status(400).json({ error: 'coverBase64 fehlt' });
+      if (!songName || !artist) return res.status(400).json({ error: 'songName und artist sind erforderlich' });
+
+      const ts = Date.now();
+      const safeMp3Name = `${ts}_${sanitizeFilename(mp3.originalname)}`;
+      const mp3Path = `/songs/${safeMp3Name}`;
+
+      console.log('Uploading MP3 to Dropbox:', mp3Path);
+
+      const uploadRes = await dbx.filesUpload({
+        path: mp3Path,
+        contents: mp3.buffer,
+        mode: 'add',
+        autorename: true
+      });
+
+      console.log('MP3 upload result:', uploadRes?.result?.name || uploadRes);
+
+      const metadata = {
+        songName: String(songName),
+        artist: String(artist),
+        coverBase64: String(coverBase64),
+        path: uploadRes?.result?.path_lower || uploadRes?.result?.path_display || mp3Path,
+        mp3Name: uploadRes?.result?.name || safeMp3Name,
+        uploadedAt: new Date().toISOString()
+      };
+
+      const metaFilename = `/meta/${ts}_${sanitizeFilename(songName)}.json`;
+      await dbx.filesUpload({
+        path: metaFilename,
+        contents: Buffer.from(JSON.stringify(metadata, null, 2), 'utf8'),
+        mode: 'add',
+        autorename: true
+      });
+
+      return res.json({ success: true, path: metadata.path, metaPath: metaFilename, metadata });
+    } catch (err) {
+      console.error('=== UPLOAD ERROR ===', err?.response?.data || err.message || err);
+      return res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Parse / list songs: read /meta folder, fetch each JSON and return songs array
+  app.get('/parse', async (req, res) => {
+    try {
+      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
+
+      const listRes = await dbx.filesListFolder({ path: '/meta' }).catch((e) => {
+        console.warn('filesListFolder /meta failed, returning empty list', e?.error || e);
+        return { result: { entries: [] } };
+      });
+
+      const entries = (listRes && listRes.result && listRes.result.entries) || [];
+
+      const songs = [];
+      for (const e of entries) {
+        try {
+          const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower || e.path_display || e.path_lower });
+          const link = tl?.result?.link || tl?.link;
+          if (!link) {
+            console.warn('No temp link for meta:', e.path_display);
+            continue;
+          }
+          const r = await fetch(link);
+          if (!r.ok) {
+            console.warn('Failed to fetch meta content for', e.path_display, r.status);
+            continue;
+          }
+          const json = await r.json();
+          songs.push({
+            songName: json.songName || json.mp3Name || e.name,
+            artist: json.artist || 'Unknown',
+            coverBase64: json.coverBase64 || null,
+            path: json.path || null,
+            uploadedAt: json.uploadedAt || null
+          });
+        } catch (errMeta) {
+          console.warn('Error fetching/parsing meta file', e.path_display, errMeta?.message || errMeta);
+        }
+      }
+
+      return res.json({ songs });
+    } catch (err) {
+      console.error('=== LIST ERROR ===', err?.response?.data || err.message || err);
+      return res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // temp-link endpoint -> returns a direct link to Dropbox-stored file (for playback)
+  app.get('/temp-link', async (req, res) => {
+    try {
+      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
+
+      const path = req.query.path;
+      if (!path) return res.status(400).json({ error: 'path query param required' });
+
+      const tl = await dbx.filesGetTemporaryLink({ path });
+      const link = tl?.result?.link || tl?.link;
+      if (!link) return res.status(500).json({ error: 'Kein temporärer Link erhalten' });
+
+      return res.json({ link });
+    } catch (err) {
+      console.error('=== TEMPLINK ERROR ===', err?.response?.data || err.message || err);
+      return res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // download fallback: fetch the temporary link and stream the file through den Server
+  app.get('/download', async (req, res) => {
+    try {
+      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
+
+      const path = req.query.path;
+      if (!path) return res.status(400).json({ error: 'path query param required' });
+
+      const tl = await dbx.filesGetTemporaryLink({ path });
+      const link = tl?.result?.link || tl?.link;
+      if (!link) return res.status(500).json({ error: 'Kein temporärer Link erhalten' });
+
+      const r = await fetch(link);
+      if (!r.ok) return res.status(502).json({ error: 'Failed to fetch file from Dropbox', status: r.status });
+
+      res.setHeader('content-type', r.headers.get('content-type') || 'application/octet-stream');
+      const cl = r.headers.get('content-length');
+      if (cl) res.setHeader('content-length', cl);
+
+      r.body.pipe(res);
+    } catch (err) {
+      console.error('=== DOWNLOAD ERROR ===', err?.response?.data || err.message || err);
+      return res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Delete file (by Dropbox path) - also attempt to delete corresponding metadata file(s)
+  app.delete('/delete', async (req, res) => {
+    try {
+      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
+
+      const { path } = req.body;
+      if (!path) return res.status(400).json({ error: 'Pfad fehlt' });
+
+      const delRes = await dbx.filesDeleteV2({ path });
+      console.log('Deleted file:', delRes?.result?.metadata?.name);
+
+      const listRes = await dbx.filesListFolder({ path: '/meta' }).catch(() => ({ result: { entries: [] } }));
+      const metaEntries = (listRes && listRes.result && listRes.result.entries) || [];
+      for (const e of metaEntries) {
+        try {
+          const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower || e.path_display });
+          const r = await fetch(tl.result?.link || tl.link);
+          if (!r.ok) continue;
+          const json = await r.json();
+          if (json.path === path) {
+            await dbx.filesDeleteV2({ path: e.path_lower || e.path_display });
+            console.log('Deleted meta file:', e.path_display);
+          }
+        } catch (errMeta) {
+          // ignore per-file errors
+        }
+      }
+
+      return res.json({ success: true, name: delRes?.result?.metadata?.name });
+    } catch (err) {
+      console.error('=== DELETE ERROR ===', err?.response?.data || err.message || err);
+      return res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.listen(port, () => console.log(`Server läuft auf http://localhost:${port}`));
+})();
