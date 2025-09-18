@@ -1,7 +1,8 @@
 // server.js
-const express = require("express");
-const axios = require("axios");
-const bodyParser = require("body-parser");
+// server.js (ES module style)
+import express from "express";
+import axios from "axios";
+import bodyParser from "body-parser";
 
 const app = express();
 app.use(bodyParser.json());
