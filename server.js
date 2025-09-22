@@ -5,6 +5,7 @@ import { Dropbox } from 'dropbox';
 import fetch from 'node-fetch';
 import cors from 'cors';
 import axios from 'axios';
+import crypto from 'crypto';
 
 const app = express();
 const port = 3000; // fest gesetzt, kannst du ändern
@@ -71,6 +72,50 @@ async function refreshAccessToken() {
   }
 }
 
+// ID-Generator (URL-safe Base64-like)
+function generateId() {
+  return crypto
+    .randomBytes(16)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+    .slice(0, 22);
+}
+
+// Hilfsfunktion: finde Meta (und zugehörigen Eintrag) per id
+async function findMetaById(id) {
+  if (!dbx) throw new Error('Dropbox client not initialized');
+  const listRes = await dbx.filesListFolder({ path: '/meta' }).catch(() => ({ result: { entries: [] } }));
+  const entries = (listRes && listRes.result && listRes.result.entries) || [];
+
+  for (const e of entries) {
+    try {
+      const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower || e.path_display });
+      const link = tl?.result?.link || tl?.link;
+      if (!link) continue;
+      const r = await fetch(link);
+      if (!r.ok) continue;
+      const json = await r.json();
+      if (json.id && json.id === id) {
+        return { meta: json, entry: e };
+      }
+    } catch (err) {
+      // ignore per-file errors
+    }
+  }
+  return null;
+}
+
+// Hilfsfunktion: optionales Auflösen - akzeptiert id oder path
+async function resolveIdOrPath({ id, path }) {
+  if (path) return { path }; // bereits ein Pfad - einfach zurückgeben
+  if (!id) throw new Error('Weder id noch path angegeben');
+  const found = await findMetaById(id);
+  if (!found) throw new Error('Keine Metadatei zu dieser id gefunden');
+  return { path: found.meta.path, metaEntry: found.entry, meta: found.meta };
+}
+
 // ---------- START: Token holen, dann Server starten ----------
 (async () => {
   await refreshAccessToken();
@@ -116,7 +161,11 @@ async function refreshAccessToken() {
 
       console.log('MP3 upload result:', uploadRes?.result?.name || uploadRes);
 
+      // generiere eine öffentliche id für den Song (statt Pfad preiszugeben)
+      const id = generateId();
+
       const metadata = {
+        id,
         songName: String(songName),
         artist: String(artist),
         coverBase64: String(coverBase64),
@@ -133,7 +182,8 @@ async function refreshAccessToken() {
         autorename: true
       });
 
-      return res.json({ success: true, path: metadata.path, metaPath: metaFilename, metadata });
+      // Rückgabe: id + Meta-Infos (kein direkter Pfad)
+      return res.json({ success: true, id, metaPath: metaFilename, metadata: { id: metadata.id, songName: metadata.songName, artist: metadata.artist, uploadedAt: metadata.uploadedAt } });
     } catch (err) {
       console.error('=== UPLOAD ERROR ===', err?.response?.data || err.message || err);
       return res.status(500).json({ error: String(err) });
@@ -141,6 +191,7 @@ async function refreshAccessToken() {
   });
 
   // Parse / list songs: read /meta folder, fetch each JSON and return songs array
+  // ACHTUNG: Hier wird absichtlich NICHT der Dropbox-Pfad zurückgegeben.
   app.get('/parse', async (req, res) => {
     try {
       if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
@@ -168,11 +219,12 @@ async function refreshAccessToken() {
           }
           const json = await r.json();
           songs.push({
+            id: json.id || null,
             songName: json.songName || json.mp3Name || e.name,
             artist: json.artist || 'Unknown',
             coverBase64: json.coverBase64 || null,
-            path: json.path || null,
             uploadedAt: json.uploadedAt || null
+            // kein path mehr hier!
           });
         } catch (errMeta) {
           console.warn('Error fetching/parsing meta file', e.path_display, errMeta?.message || errMeta);
@@ -187,33 +239,43 @@ async function refreshAccessToken() {
   });
 
   // temp-link endpoint -> returns a direct link to Dropbox-stored file (for playback)
+  // Akzeptiert query param "id" (neu) oder "path" (alt, backwards compatible)
   app.get('/temp-link', async (req, res) => {
     try {
       if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
 
-      const path = req.query.path;
-      if (!path) return res.status(400).json({ error: 'path query param required' });
+      const { id, path } = req.query;
+      if (!id && !path) return res.status(400).json({ error: 'id oder path query param required' });
 
-      const tl = await dbx.filesGetTemporaryLink({ path });
+      const resolved = await resolveIdOrPath({ id, path });
+      const resolvedPath = resolved.path;
+      if (!resolvedPath) return res.status(404).json({ error: 'Pfad nicht gefunden' });
+
+      const tl = await dbx.filesGetTemporaryLink({ path: resolvedPath });
       const link = tl?.result?.link || tl?.link;
       if (!link) return res.status(500).json({ error: 'Kein temporärer Link erhalten' });
 
-      return res.json({ link });
+      return res.json({ link, id: id || null });
     } catch (err) {
       console.error('=== TEMPLINK ERROR ===', err?.response?.data || err.message || err);
       return res.status(500).json({ error: String(err) });
     }
   });
 
-  // download fallback: fetch the temporary link and stream the file through den Server
+  // download fallback: fetch the temporary link and stream die Datei durch den Server
+  // Akzeptiert query param "id" (neu) oder "path" (alt)
   app.get('/download', async (req, res) => {
     try {
       if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
 
-      const path = req.query.path;
-      if (!path) return res.status(400).json({ error: 'path query param required' });
+      const { id, path } = req.query;
+      if (!id && !path) return res.status(400).json({ error: 'id oder path query param required' });
 
-      const tl = await dbx.filesGetTemporaryLink({ path });
+      const resolved = await resolveIdOrPath({ id, path });
+      const resolvedPath = resolved.path;
+      if (!resolvedPath) return res.status(404).json({ error: 'Pfad nicht gefunden' });
+
+      const tl = await dbx.filesGetTemporaryLink({ path: resolvedPath });
       const link = tl?.result?.link || tl?.link;
       if (!link) return res.status(500).json({ error: 'Kein temporärer Link erhalten' });
 
@@ -231,35 +293,59 @@ async function refreshAccessToken() {
     }
   });
 
-  // Delete file (by Dropbox path) - also attempt to delete corresponding metadata file(s)
+  // Delete file (by id OR Dropbox path) - also attempt to delete corresponding metadata file(s)
+  // Wenn "id" übergeben wird, lösche die MP3 (path) und die passende Meta-Datei.
   app.delete('/delete', async (req, res) => {
     try {
       if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
 
-      const { path } = req.body;
-      if (!path) return res.status(400).json({ error: 'Pfad fehlt' });
+      const { id, path } = req.body || {};
+      if (!id && !path) return res.status(400).json({ error: 'id oder path im Body erforderlich' });
 
-      const delRes = await dbx.filesDeleteV2({ path });
+      // Wenn id => meta finden und path daraus nehmen
+      let resolved;
+      try {
+        resolved = await resolveIdOrPath({ id, path });
+      } catch (e) {
+        return res.status(404).json({ error: String(e.message || e) });
+      }
+
+      const resolvedPath = resolved.path;
+      if (!resolvedPath) return res.status(404).json({ error: 'Pfad nicht gefunden' });
+
+      // Delete MP3
+      const delRes = await dbx.filesDeleteV2({ path: resolvedPath });
       console.log('Deleted file:', delRes?.result?.metadata?.name);
 
-      const listRes = await dbx.filesListFolder({ path: '/meta' }).catch(() => ({ result: { entries: [] } }));
-      const metaEntries = (listRes && listRes.result && listRes.result.entries) || [];
-      for (const e of metaEntries) {
+      // Wenn wir eine metaEntry haben (bei id-Auflösung), löschen wir genau diese Meta-Datei
+      if (resolved.metaEntry) {
         try {
-          const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower || e.path_display });
-          const r = await fetch(tl.result?.link || tl.link);
-          if (!r.ok) continue;
-          const json = await r.json();
-          if (json.path === path) {
-            await dbx.filesDeleteV2({ path: e.path_lower || e.path_display });
-            console.log('Deleted meta file:', e.path_display);
+          await dbx.filesDeleteV2({ path: resolved.metaEntry.path_lower || resolved.metaEntry.path_display });
+          console.log('Deleted meta file:', resolved.metaEntry.path_display);
+        } catch (e) {
+          console.warn('Konnte Meta-Datei nicht löschen (id):', e?.message || e);
+        }
+      } else {
+        // Fallback: suche meta files, die path referenzieren und lösche sie
+        const listRes = await dbx.filesListFolder({ path: '/meta' }).catch(() => ({ result: { entries: [] } }));
+        const metaEntries = (listRes && listRes.result && listRes.result.entries) || [];
+        for (const e of metaEntries) {
+          try {
+            const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower || e.path_display });
+            const r = await fetch(tl.result?.link || tl.link);
+            if (!r.ok) continue;
+            const json = await r.json();
+            if (json.path === resolvedPath) {
+              await dbx.filesDeleteV2({ path: e.path_lower || e.path_display });
+              console.log('Deleted meta file:', e.path_display);
+            }
+          } catch (errMeta) {
+            // ignore per-file errors
           }
-        } catch (errMeta) {
-          // ignore per-file errors
         }
       }
 
-      return res.json({ success: true, name: delRes?.result?.metadata?.name });
+      return res.json({ success: true, name: delRes?.result?.metadata?.name, id: id || null });
     } catch (err) {
       console.error('=== DELETE ERROR ===', err?.response?.data || err.message || err);
       return res.status(500).json({ error: String(err) });
