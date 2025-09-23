@@ -281,8 +281,8 @@ async function resolveIdOrPath({ id, path }) {
           id: m.id,
           songName: m.songName || m.mp3Name,
           artist: m.artist || 'Unknown',
-          coverBase64: m.coverBase64 || null,
-          uploadedAt: m.uploadedAt || null
+          uploadedAt: m.uploadedAt || null,
+          coverBase64: m.coverBase64 || null
           // kein path standardmäßig hier — aber du hast jetzt beim Upload path in der Response
         });
       }
