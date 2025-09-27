@@ -182,7 +182,64 @@ async function resolveIdOrPath({ id, path }) {
   await loadMetaCache();
 
   // ---------- ENDPOINTS ----------
-  app.get('/', (req, res) => res.send('Dropbox Backend (mit id+path + meta-Cache) läuft ✅'));
+  app.get('/', (req, res) => res.send('Audionix backend running.'));
+
+
+  /**
+ * GET /change?id=<id> -> gibt Metadaten zurück
+ * POST /change -> aktualisiert Metadaten
+ * Body: { id, songName?, artist?, coverBase64? }
+ */
+app.route('/change')
+  // GET: liefert die Metadaten eines Songs
+  .get(async (req, res) => {
+    try {
+      const { id } = req.query;
+      if (!id) return res.status(400).json({ error: 'id query param required' });
+
+      const meta = await findMetaById(id);
+      if (!meta) return res.status(404).json({ error: 'Song nicht gefunden' });
+
+      return res.json({ metadata: meta });
+    } catch (err) {
+      console.error('=== CHANGE GET ERROR ===', err?.message || err);
+      return res.status(500).json({ error: String(err) });
+    }
+  })
+  // POST: aktualisiert die Metadaten eines Songs
+  .post(async (req, res) => {
+    try {
+      const { id, songName, artist, coverBase64 } = req.body || {};
+      if (!id) return res.status(400).json({ error: 'id im Body erforderlich' });
+
+      const meta = await findMetaById(id);
+      if (!meta) return res.status(404).json({ error: 'Song nicht gefunden' });
+      if (!meta.metaPath) return res.status(500).json({ error: 'Meta-Dateipfad fehlt' });
+
+      // Update Meta lokal
+      const updatedMeta = {
+        ...meta,
+        songName: songName ?? meta.songName,
+        artist: artist ?? meta.artist,
+        coverBase64: coverBase64 ?? meta.coverBase64
+      };
+
+      // Speichere zurück auf Dropbox (overwrite)
+      await dbx.filesUpload({
+        path: meta.metaPath,
+        contents: Buffer.from(JSON.stringify(updatedMeta, null, 2), 'utf8'),
+        mode: { '.tag': 'overwrite' }
+      });
+
+      // Update Cache
+      metaCache.set(id, updatedMeta);
+
+      return res.json({ success: true, metadata: updatedMeta });
+    } catch (err) {
+      console.error('=== CHANGE POST ERROR ===', err?.message || err);
+      return res.status(500).json({ error: String(err) });
+    }
+  });
 
   /**
    * Upload:
