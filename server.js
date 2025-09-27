@@ -18,7 +18,7 @@ const REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN || 'L4N3aNJBnM8AAAAAAAAA
 
 // Middlewares
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 // Multer (in-memory)
 const upload = multer({ storage: multer.memoryStorage() });
