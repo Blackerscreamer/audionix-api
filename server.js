@@ -120,12 +120,26 @@ async function resolveIdOrPath({ id, path }) {
 async function uploadToImgBB(base64) {
   const params = new URLSearchParams();
   params.append('key', IMGBB_API_KEY);
-  params.append('image', base64.replace(/^data:image\/\w+;base64,/, ''));
-  const res = await fetch('https://api.imgbb.com/1/upload', { method: 'POST', body: params });
-  if (!res.ok) throw new Error('ImgBB upload failed: ' + res.status);
-  const j = await res.json();
+
+  let cleanBase64 = base64.trim();
+  if (cleanBase64.startsWith('data:image')) {
+    cleanBase64 = cleanBase64.replace(/^data:image\/\w+;base64,/, '');
+  }
+
+  params.append('image', cleanBase64);
+
+  const res = await fetch('https://api.imgbb.com/1/upload', {
+    method: 'POST',
+    body: params
+  });
+
+  const text = await res.text();
+  if (!res.ok) throw new Error('ImgBB upload failed: ' + res.status + ' - ' + text);
+
+  const j = JSON.parse(text);
   return j.data.url;
 }
+
 
 // ----------------- Endpoints -----------------
 app.get('/', (req, res) => res.send('Audionix backend running.'));
