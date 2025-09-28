@@ -66,28 +66,34 @@ async function loadMetaCache() {
   metaCache.clear();
   if (!dbx) return;
 
-  try {
-    const listRes = await dbx.filesListFolder({ path: '/meta' }).catch(() => ({ result: { entries: [] } }));
-    const entries = listRes?.result?.entries || [];
+try {
+  const listRes = await dbx.filesListFolder({ path: '/meta' }).catch(() => ({ result: { entries: [] } }));
+  const entries = listRes?.result?.entries || [];
 
-    await Promise.all(entries.map(async (e) => {
-      try {
-        const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower });
-        const r = await fetch(tl?.result?.link);
-        if (!r.ok) return;
-        const json = await r.json();
+  await Promise.all(entries.map(async (e) => {
+    try {
+      const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower });
+      const r = await fetch(tl?.result?.link);
+      if (!r.ok) return;
+      const json = await r.json();
 
-        if (json?.id) {
-          metaCache.set(json.id, { ...json, metaPath: e.path_lower });
-        }
-      } catch (err) {
-        console.warn('Fehler beim Laden einer meta-Datei:', e.path_display, err.message);
+      if (json?.id) {
+        metaCache.set(json.id, {
+          ...json,
+          metaPath: e.path_lower,
+          coverPath: json.coverPath || null  // <-- hier den Dropbox-Pfad zum Cover speichern
+        });
       }
-    }));
-    console.log(`Meta-Cache geladen: ${metaCache.size} Einträge.`);
-  } catch (err) {
-    console.error('Fehler beim Auflisten/Laden von /meta:', err.message);
-  }
+    } catch (err) {
+      console.warn('Fehler beim Laden einer meta-Datei:', e.path_display, err.message);
+    }
+  }));
+
+  console.log(`Meta-Cache geladen: ${metaCache.size} Einträge.`);
+} catch (err) {
+  console.error('Fehler beim Auflisten/Laden von /meta:', err?.response?.data || err.message || err);
+}
+
 }
 
 async function findMetaById(id) {
@@ -245,25 +251,37 @@ async function migrateBase64Covers() {
   });
 
   // Temp-link (mp3 oder cover)
-  app.get('/temp-link', async (req, res) => {
-    try {
-      const { id, path, type } = req.query;
-      let resolved;
-      if (id) {
-        const meta = await findMetaById(id);
-        if (!meta) return res.status(404).json({ error: 'Song nicht gefunden' });
-        const filePath = type === 'cover' ? meta.coverPath : meta.path;
-        resolved = { path: filePath, meta };
-      } else {
-        resolved = await resolveIdOrPath({ path });
-      }
+ app.get('/temp-link', async (req, res) => {
+  try {
+    if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
 
-      const tl = await dbx.filesGetTemporaryLink({ path: resolved.path });
-      res.json({ link: tl.result.link, id: id || null });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
+    const { id, path, type } = req.query;
+    if (!id && !path) return res.status(400).json({ error: 'id oder path query param required' });
+
+    // Wenn type=cover und id gegeben, nutze coverPath aus Cache
+    let resolvedPath;
+    if (type === 'cover' && id) {
+      const meta = await findMetaById(id);
+      if (!meta || !meta.coverPath) return res.status(404).json({ error: 'Cover nicht gefunden' });
+      resolvedPath = meta.coverPath;
+    } else {
+      const resolved = await resolveIdOrPath({ id, path });
+      resolvedPath = resolved.path;
     }
-  });
+
+    if (!resolvedPath) return res.status(404).json({ error: 'Pfad nicht gefunden' });
+
+    const tl = await dbx.filesGetTemporaryLink({ path: resolvedPath });
+    const link = tl?.result?.link || tl?.link;
+    if (!link) return res.status(500).json({ error: 'Kein temporärer Link erhalten' });
+
+    return res.json({ link, id });
+  } catch (err) {
+    console.error('=== TEMPLINK ERROR ===', err?.response?.data || err.message || err);
+    return res.status(500).json({ error: String(err) });
+  }
+});
+
 
   // start server
   app.listen(port, () => console.log(`Server läuft auf http://localhost:${port}`));
