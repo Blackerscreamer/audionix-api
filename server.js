@@ -14,7 +14,7 @@ const port = process.env.PORT || 3000;
 const CLIENT_ID = process.env.DROPBOX_CLIENT_ID || '1w0y4rdnuvbe476';
 const CLIENT_SECRET = process.env.DROPBOX_CLIENT_SECRET || 'je5paqlcai1vxhc';
 const REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN || 'L4N3aNJBnM8AAAAAAAAAAX9jprkmTjHaduGuaKzGxtnODQ5UhEzEUIvgUFXQ3uop';
-const IMGBB_API_KEY = process.env.IMGBB_API_KEY || '3387d665ebe211402c5ae8166b27c6ae';
+const IMGBB_API_KEY = process.env.IMGBB_API_KEY || 'ae249a87d0c5225d2dc78d231eafae00';
 
 // Middlewares
 app.use(cors({ origin: '*' }));
