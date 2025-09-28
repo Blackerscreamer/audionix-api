@@ -10,24 +10,19 @@ import crypto from 'crypto';
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ---------- KONFIGURATION (ersetze durch deine Werte oder ENV) ----------
+// ---------- KONFIGURATION ----------
 const CLIENT_ID = process.env.DROPBOX_CLIENT_ID || '1w0y4rdnuvbe476';
 const CLIENT_SECRET = process.env.DROPBOX_CLIENT_SECRET || 'je5paqlcai1vxhc';
 const REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN || 'L4N3aNJBnM8AAAAAAAAAAX9jprkmTjHaduGuaKzGxtnODQ5UhEzEUIvgUFXQ3uop';
-// ---------------------------------------------------------------------
 
 // Middlewares
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
-
-// Multer (in-memory)
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Interner Zustand
 let ACCESS_TOKEN = null;
 let dbx = null;
-
-// In-memory cache: id -> metadata (meta contains at least id, path, songName, artist, coverBase64, uploadedAt, metaPath)
 const metaCache = new Map();
 
 // ---------- Hilfsfunktionen ----------
@@ -39,24 +34,12 @@ function createDropboxClient(token) {
   dbx = new Dropbox({ accessToken: token, fetch });
 }
 
-// ID-Generator (URL-safe)
 function generateId() {
-  return crypto
-    .randomBytes(16)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '')
-    .slice(0, 22);
+  return crypto.randomBytes(16).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '').slice(0, 22);
 }
 
-// Token automatisch erneuern (refresh_token flow)
 async function refreshAccessToken() {
-  if (!REFRESH_TOKEN || REFRESH_TOKEN === 'DEIN_MANUELL_GEHOLTENER_REFRESH_TOKEN') {
-    console.warn('Kein gültiger REFRESH_TOKEN gesetzt. Ersetze den Platzhalter in server.js oder setze die Umgebungsvariable.');
-    return;
-  }
-
   try {
     const params = new URLSearchParams({
       grant_type: 'refresh_token',
@@ -70,413 +53,218 @@ async function refreshAccessToken() {
     });
 
     const token = response.data.access_token;
-    const expiresIn = response.data.expires_in;
-
-    if (!token) {
-      console.error('Kein access_token in der Antwort gefunden:', response.data);
-      return;
-    }
-
     ACCESS_TOKEN = token;
     createDropboxClient(ACCESS_TOKEN);
 
-    console.log('Neuer Access Token erhalten (gültig für', expiresIn, 'Sekunden).');
+    console.log('Neuer Access Token erhalten.');
   } catch (err) {
-    console.error('Fehler beim Refreshen des Tokens:', err?.response?.data || err.message || err);
+    console.error('Fehler beim Refreshen des Tokens:', err?.response?.data || err.message);
   }
 }
 
-// Lädt alle meta-Dateien aus /meta in den In-Memory-Cache
 async function loadMetaCache() {
   metaCache.clear();
   if (!dbx) return;
 
   try {
     const listRes = await dbx.filesListFolder({ path: '/meta' }).catch(() => ({ result: { entries: [] } }));
-    const entries = (listRes && listRes.result && listRes.result.entries) || [];
+    const entries = listRes?.result?.entries || [];
 
-    // Paralleles Laden, aber in kontrolliertem Array
-    const promises = entries.map(async (e) => {
+    await Promise.all(entries.map(async (e) => {
       try {
-        // hole temporären Link, dann lade JSON
-        const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower || e.path_display });
-        const link = tl?.result?.link || tl?.link;
-        if (!link) return;
-
-        const r = await fetch(link);
+        const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower });
+        const r = await fetch(tl?.result?.link);
         if (!r.ok) return;
         const json = await r.json();
 
-        if (json && json.id) {
-          // speichere meta + referenz zur meta-Datei
-          metaCache.set(json.id, {
-            ...json,
-            metaPath: e.path_lower || e.path_display
-          });
+        if (json?.id) {
+          metaCache.set(json.id, { ...json, metaPath: e.path_lower });
         }
       } catch (err) {
-        // ignorieren, aber loggen
-        console.warn('Fehler beim Laden einer meta-Datei:', e.path_display, err?.message || err);
+        console.warn('Fehler beim Laden einer meta-Datei:', e.path_display, err.message);
       }
-    });
-
-    await Promise.all(promises);
+    }));
     console.log(`Meta-Cache geladen: ${metaCache.size} Einträge.`);
   } catch (err) {
-    console.error('Fehler beim Auflisten/Laden von /meta:', err?.response?.data || err.message || err);
+    console.error('Fehler beim Auflisten/Laden von /meta:', err.message);
   }
 }
 
-// Sucht Meta per ID (nutzt Cache; falls nicht vorhanden, versucht Cache neu zu laden)
 async function findMetaById(id) {
   if (metaCache.has(id)) return metaCache.get(id);
-
-  // Falls Cache leer oder Eintrag fehlt, nochmal neu laden (Fallback)
   await loadMetaCache();
   return metaCache.get(id) || null;
 }
 
-// Resolve helper: akzeptiert { id, path } und gibt { path, meta } zurück.
-// - path, das mit '/' beginnt wird direkt verwendet (schnell)
-// - path, das wie eine id aussieht (kein Slash, nur A-Za-z0-9_- etc.) wird als id interpretiert
-// - id wird aus dem Cache aufgelöst
 async function resolveIdOrPath({ id, path }) {
   if (!id && !path) throw new Error('Weder id noch path angegeben');
-
-  // Wenn path vorhanden und mit '/' beginnt -> direkt nutzen
-  if (path && path.startsWith('/')) {
-    return { path, meta: null };
-  }
-
-  // Wenn path vorhanden, aber keinen Slash enthält und nach dem ID-Pattern aussieht,
-  // dann behandeln wir es wie eine id (praktisch: ?path=eP07... steigt damit um)
-  if (path && /^[A-Za-z0-9\-_]{12,32}$/.test(path)) {
-    id = path;
-    path = undefined;
-  }
+  if (path && path.startsWith('/')) return { path, meta: null };
+  if (path && /^[A-Za-z0-9\-_]{12,32}$/.test(path)) { id = path; path = undefined; }
 
   if (id) {
     const meta = await findMetaById(id);
     if (!meta) throw new Error('Keine Metadatei zu dieser id gefunden');
     return { path: meta.path, meta };
   }
-
-  // Fallback - falls path doch gesetzt ist (z.B. ohne leading slash), normalisieren wir
-  if (path) {
-    // Falls Nutzer 'songs/...' (ohne führenden slash) sendet, setzen wir '/'
-    const normalized = path.startsWith('/') ? path : `/${path}`;
-    return { path: normalized, meta: null };
-  }
-
-  throw new Error('Konnte id/path nicht auflösen');
+  return { path: `/${path}`, meta: null };
 }
 
-// ---------- Server start / Token holen ----------
+// ---------- Migration: Base64 -> Datei ----------
+async function migrateBase64Covers() {
+  for (const [id, meta] of metaCache) {
+    if (meta.coverBase64 && !meta.coverPath) {
+      try {
+        const buffer = Buffer.from(meta.coverBase64.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+        const coverPath = `/covers/${id}_cover.jpg`;
+
+        await dbx.filesUpload({
+          path: coverPath,
+          contents: buffer,
+          mode: { '.tag': 'overwrite' }
+        });
+
+        const updatedMeta = { ...meta, coverPath, coverBase64: undefined };
+        await dbx.filesUpload({
+          path: meta.metaPath,
+          contents: Buffer.from(JSON.stringify(updatedMeta, null, 2), 'utf8'),
+          mode: { '.tag': 'overwrite' }
+        });
+
+        metaCache.set(id, updatedMeta);
+        console.log(`Migrated cover for ${id}`);
+      } catch (err) {
+        console.warn(`Migration failed for ${id}:`, err.message);
+      }
+    }
+  }
+}
+
+// ---------- Server start ----------
 (async () => {
   await refreshAccessToken();
-  // Dropbox-Token alle ~3.5 Stunden erneuern (Dropbox Tokens ~4h)
-  const REFRESH_INTERVAL_MS = 12600 * 1000;
-  setInterval(refreshAccessToken, REFRESH_INTERVAL_MS);
-
-  // Meta-Cache initial laden (wenn DBX initialisiert)
+  setInterval(refreshAccessToken, 3.5 * 60 * 60 * 1000);
   await loadMetaCache();
+  await migrateBase64Covers();
 
   // ---------- ENDPOINTS ----------
   app.get('/', (req, res) => res.send('Audionix backend running.'));
 
-
-  /**
- * GET /change?id=<id> -> gibt Metadaten zurück
- * POST /change -> aktualisiert Metadaten
- * Body: { id, songName?, artist?, coverBase64? }
- */
-app.route('/change')
-  // GET: liefert die Metadaten eines Songs
-  .get(async (req, res) => {
-    try {
+  // GET/POST change
+  app.route('/change')
+    .get(async (req, res) => {
       const { id } = req.query;
-      if (!id) return res.status(400).json({ error: 'id query param required' });
-
       const meta = await findMetaById(id);
       if (!meta) return res.status(404).json({ error: 'Song nicht gefunden' });
+      res.json({ metadata: meta });
+    })
+    .post(async (req, res) => {
+      try {
+        const { id, songName, artist, coverBase64 } = req.body;
+        const meta = await findMetaById(id);
+        if (!meta) return res.status(404).json({ error: 'Song nicht gefunden' });
 
-      return res.json({ metadata: meta });
-    } catch (err) {
-      console.error('=== CHANGE GET ERROR ===', err?.message || err);
-      return res.status(500).json({ error: String(err) });
-    }
-  })
-  // POST: aktualisiert die Metadaten eines Songs
-  .post(async (req, res) => {
-    try {
-      const { id, songName, artist, coverBase64 } = req.body || {};
-      if (!id) return res.status(400).json({ error: 'id im Body erforderlich' });
+        let coverPath = meta.coverPath;
+        if (coverBase64) {
+          const buffer = Buffer.from(coverBase64.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+          coverPath = `/covers/${id}_cover.jpg`;
+          await dbx.filesUpload({ path: coverPath, contents: buffer, mode: { '.tag': 'overwrite' } });
+        }
 
-      const meta = await findMetaById(id);
-      if (!meta) return res.status(404).json({ error: 'Song nicht gefunden' });
-      if (!meta.metaPath) return res.status(500).json({ error: 'Meta-Dateipfad fehlt' });
+        const updatedMeta = {
+          ...meta,
+          songName: songName ?? meta.songName,
+          artist: artist ?? meta.artist,
+          coverPath
+        };
 
-      // Update Meta lokal
-      const updatedMeta = {
-        ...meta,
-        songName: songName ?? meta.songName,
-        artist: artist ?? meta.artist,
-        coverBase64: coverBase64 ?? meta.coverBase64
-      };
+        await dbx.filesUpload({
+          path: meta.metaPath,
+          contents: Buffer.from(JSON.stringify(updatedMeta, null, 2), 'utf8'),
+          mode: { '.tag': 'overwrite' }
+        });
 
-      // Speichere zurück auf Dropbox (overwrite)
-      await dbx.filesUpload({
-        path: meta.metaPath,
-        contents: Buffer.from(JSON.stringify(updatedMeta, null, 2), 'utf8'),
-        mode: { '.tag': 'overwrite' }
-      });
+        metaCache.set(id, updatedMeta);
+        res.json({ success: true, metadata: updatedMeta });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
 
-      // Update Cache
-      metaCache.set(id, updatedMeta);
-
-      return res.json({ success: true, metadata: updatedMeta });
-    } catch (err) {
-      console.error('=== CHANGE POST ERROR ===', err?.message || err);
-      return res.status(500).json({ error: String(err) });
-    }
-  });
-
-  /**
-   * Upload:
-   * - FormData: file (mp3), coverBase64, songName, artist
-   * - Response: { success: true, id, path, metadata: { ... } }
-   */
+  // Upload
   app.post('/upload', upload.single('file'), async (req, res) => {
     try {
-      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
-
       const mp3 = req.file;
-      const { coverBase64, songName, artist } = req.body || {};
-
-      if (!mp3) return res.status(400).json({ error: 'Keine Datei hochgeladen (field "file")' });
-
-      const isMp3Mime = (mp3.mimetype === 'audio/mpeg' || mp3.mimetype === 'audio/mp3');
-      const isMp3Ext = mp3.originalname.toLowerCase().endsWith('.mp3');
-      if (!isMp3Mime && !isMp3Ext) {
-        return res.status(400).json({ error: 'Nur MP3-Dateien erlaubt' });
+      const { coverBase64, songName, artist } = req.body;
+      if (!mp3 || !coverBase64 || !songName || !artist) {
+        return res.status(400).json({ error: 'MP3, Cover, Songname, Artist erforderlich' });
       }
 
-      if (!coverBase64) return res.status(400).json({ error: 'coverBase64 fehlt' });
-      if (!songName || !artist) return res.status(400).json({ error: 'songName und artist sind erforderlich' });
-
-      const ts = Date.now();
       const id = generateId();
-      const safeMp3Name = `${id}_${sanitizeFilename(mp3.originalname)}`; // nutze id im Filename
-      const mp3Path = `/songs/${safeMp3Name}`;
+      const safeName = sanitizeFilename(mp3.originalname);
+      const mp3Path = `/songs/${id}_${safeName}`;
 
-      console.log('Uploading MP3 to Dropbox:', mp3Path);
+      await dbx.filesUpload({ path: mp3Path, contents: mp3.buffer, mode: 'add', autorename: true });
 
-      const uploadRes = await dbx.filesUpload({
-        path: mp3Path,
-        contents: mp3.buffer,
-        mode: 'add',
-        autorename: true
-      });
+      const coverBuffer = Buffer.from(coverBase64.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+      const coverPath = `/covers/${id}_cover.jpg`;
+      await dbx.filesUpload({ path: coverPath, contents: coverBuffer, mode: 'add', autorename: true });
 
-      console.log('MP3 upload result:', uploadRes?.result?.name || uploadRes);
-
-      // Metadaten (inkl. id und dem gespeicherten dropbox-path)
       const metadata = {
-        id,
-        songName: String(songName),
-        artist: String(artist),
-        coverBase64: String(coverBase64),
-        path: uploadRes?.result?.path_lower || uploadRes?.result?.path_display || mp3Path,
-        mp3Name: uploadRes?.result?.name || safeMp3Name,
+        id, songName, artist,
+        path: mp3Path,
+        coverPath,
         uploadedAt: new Date().toISOString()
       };
 
-      const metaFilename = `/meta/${ts}_${sanitizeFilename(songName)}.json`;
+      const metaPath = `/meta/${Date.now()}_${sanitizeFilename(songName)}.json`;
       await dbx.filesUpload({
-        path: metaFilename,
+        path: metaPath,
         contents: Buffer.from(JSON.stringify(metadata, null, 2), 'utf8'),
         mode: 'add',
         autorename: true
       });
 
-      // Update In-Memory-Cache direkt (schnell)
-      metaCache.set(id, { ...metadata, metaPath: metaFilename });
-
-      return res.json({
-        success: true,
-        id,
-        path: metadata.path, // WICHTIG: wir geben den Dropbox-Pfad mit zurück (schnelles Abspielen möglich)
-        metadata: {
-          id: metadata.id,
-          songName: metadata.songName,
-          artist: metadata.artist,
-          uploadedAt: metadata.uploadedAt
-        }
-      });
+      metaCache.set(id, { ...metadata, metaPath });
+      res.json({ success: true, id, metadata });
     } catch (err) {
-      console.error('=== UPLOAD ERROR ===', err?.response?.data || err.message || err);
-      return res.status(500).json({ error: String(err) });
+      res.status(500).json({ error: err.message });
     }
   });
 
-  /**
-   * Parse / list songs:
-   * - liefert alle Songs aus dem In-Memory-Cache
-   * - Achtung: gibt absichtlich keinen internen Pfad-String der Dropbox (path) bei Bedarf kannst du das ändern;
-   *   in dieser Version geben wir id, songName, artist, coverBase64, uploadedAt zurück.
-   */
+  // Parse
   app.get('/parse', async (req, res) => {
-    try {
-      // Wenn Cache leer, lade nochmal
-      if (metaCache.size === 0) {
-        await loadMetaCache();
-      }
-
-      const songs = [];
-      for (const [, m] of metaCache) {
-        songs.push({
-          id: m.id,
-          songName: m.songName || m.mp3Name,
-          artist: m.artist || 'Unknown',
-          uploadedAt: m.uploadedAt || null,
-          coverBase64: m.coverBase64 || null
-          // kein path standardmäßig hier — aber du hast jetzt beim Upload path in der Response
-        });
-      }
-
-      return res.json({ songs });
-    } catch (err) {
-      console.error('=== LIST ERROR ===', err?.response?.data || err.message || err);
-      return res.status(500).json({ error: String(err) });
-    }
+    if (metaCache.size === 0) await loadMetaCache();
+    const songs = [...metaCache.values()].map(m => ({
+      id: m.id,
+      songName: m.songName,
+      artist: m.artist,
+      uploadedAt: m.uploadedAt,
+      coverPath: m.coverPath
+    }));
+    res.json({ songs });
   });
 
-  /**
-   * temp-link -> returns Dropbox temporary link for playback
-   * Accepts query param "id" or "path" (or even ?path=<id> which is interpreted as id)
-   */
+  // Temp-link (mp3 oder cover)
   app.get('/temp-link', async (req, res) => {
     try {
-      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
-
-      const { id, path } = req.query;
-      if (!id && !path) return res.status(400).json({ error: 'id oder path query param required' });
-
-      const resolved = await resolveIdOrPath({ id, path });
-      const resolvedPath = resolved.path;
-      if (!resolvedPath) return res.status(404).json({ error: 'Pfad nicht gefunden' });
-
-      const tl = await dbx.filesGetTemporaryLink({ path: resolvedPath });
-      const link = tl?.result?.link || tl?.link;
-      if (!link) return res.status(500).json({ error: 'Kein temporärer Link erhalten' });
-
-      return res.json({ link, id: id || (resolved.meta ? resolved.meta.id : null) });
-    } catch (err) {
-      console.error('=== TEMPLINK ERROR ===', err?.response?.data || err.message || err);
-      return res.status(500).json({ error: String(err) });
-    }
-  });
-
-  /**
-   * download -> streams file through server (fallback)
-   * Accepts query param "id" or "path"
-   */
-  app.get('/download', async (req, res) => {
-    try {
-      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
-
-      const { id, path } = req.query;
-      if (!id && !path) return res.status(400).json({ error: 'id oder path query param required' });
-
-      const resolved = await resolveIdOrPath({ id, path });
-      const resolvedPath = resolved.path;
-      if (!resolvedPath) return res.status(404).json({ error: 'Pfad nicht gefunden' });
-
-      const tl = await dbx.filesGetTemporaryLink({ path: resolvedPath });
-      const link = tl?.result?.link || tl?.link;
-      if (!link) return res.status(500).json({ error: 'Kein temporärer Link erhalten' });
-
-      // Fetch the temporary link and pipe to response
-      const r = await fetch(link);
-      if (!r.ok) return res.status(502).json({ error: 'Failed to fetch file from Dropbox', status: r.status });
-
-      res.setHeader('content-type', r.headers.get('content-type') || 'application/octet-stream');
-      const cl = r.headers.get('content-length');
-      if (cl) res.setHeader('content-length', cl);
-
-      // Pipe the readable stream
-      r.body.pipe(res);
-    } catch (err) {
-      console.error('=== DOWNLOAD ERROR ===', err?.response?.data || err.message || err);
-      return res.status(500).json({ error: String(err) });
-    }
-  });
-
-  /**
-   * delete -> delete by id OR path
-   * Body: { "id": "<id>" } or { "path": "/songs/..." }
-   */
-  app.delete('/delete', async (req, res) => {
-    try {
-      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
-
-      const { id, path } = req.body || {};
-      if (!id && !path) return res.status(400).json({ error: 'id oder path im Body erforderlich' });
-
-      // Resolve
+      const { id, path, type } = req.query;
       let resolved;
-      try {
-        resolved = await resolveIdOrPath({ id, path });
-      } catch (e) {
-        return res.status(404).json({ error: String(e.message || e) });
-      }
-
-      const resolvedPath = resolved.path;
-      if (!resolvedPath) return res.status(404).json({ error: 'Pfad nicht gefunden' });
-
-      // Delete the actual file
-      const delRes = await dbx.filesDeleteV2({ path: resolvedPath });
-      console.log('Deleted file:', delRes?.result?.metadata?.name);
-
-      // If we have meta info (from cache), delete the specific meta file and remove from cache
-      if (resolved.meta && resolved.meta.metaPath) {
-        try {
-          await dbx.filesDeleteV2({ path: resolved.meta.metaPath });
-          console.log('Deleted meta file:', resolved.meta.metaPath);
-        } catch (e) {
-          console.warn('Konnte Meta-Datei nicht löschen (id):', e?.message || e);
-        }
-        metaCache.delete(resolved.meta.id);
+      if (id) {
+        const meta = await findMetaById(id);
+        if (!meta) return res.status(404).json({ error: 'Song nicht gefunden' });
+        const filePath = type === 'cover' ? meta.coverPath : meta.path;
+        resolved = { path: filePath, meta };
       } else {
-        // Fallback: scan /meta and delete any meta files that reference this path
-        const listRes = await dbx.filesListFolder({ path: '/meta' }).catch(() => ({ result: { entries: [] } }));
-        const metaEntries = (listRes && listRes.result && listRes.result.entries) || [];
-        for (const e of metaEntries) {
-          try {
-            const tl = await dbx.filesGetTemporaryLink({ path: e.path_lower || e.path_display });
-            const r = await fetch(tl.result?.link || tl.link);
-            if (!r.ok) continue;
-            const json = await r.json();
-            if (json.path === resolvedPath && (e.path_lower || e.path_display)) {
-              await dbx.filesDeleteV2({ path: e.path_lower || e.path_display });
-              console.log('Deleted meta file (fallback):', e.path_display);
-              if (json.id) metaCache.delete(json.id);
-            }
-          } catch (errMeta) {
-            // ignore per-file errors
-          }
-        }
+        resolved = await resolveIdOrPath({ path });
       }
 
-      return res.json({ success: true, name: delRes?.result?.metadata?.name, id: resolved.meta ? resolved.meta.id : null });
+      const tl = await dbx.filesGetTemporaryLink({ path: resolved.path });
+      res.json({ link: tl.result.link, id: id || null });
     } catch (err) {
-      console.error('=== DELETE ERROR ===', err?.response?.data || err.message || err);
-      return res.status(500).json({ error: String(err) });
+      res.status(500).json({ error: err.message });
     }
   });
 
   // start server
-  app.listen(port, () => {
-    console.log(`Server läuft auf http://localhost:${port}`);
-  });
+  app.listen(port, () => console.log(`Server läuft auf http://localhost:${port}`));
 })();
