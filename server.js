@@ -10,10 +10,10 @@ import crypto from 'crypto';
 const app = express();
 const port = process.env.PORT || 3000;
 
-// --------- KONFIGURATION (ersetze durch deine Werte oder ENV) ----------
-const CLIENT_ID = process.env.DROPBOX_CLIENT_ID;
-const CLIENT_SECRET = process.env.DROPBOX_CLIENT_SECRET;
-const REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN;
+// ---------- KONFIGURATION (ersetze durch deine Werte oder ENV) ----------
+const CLIENT_ID = process.env.DROPBOX_CLIENT_ID || '1w0y4rdnuvbe476';
+const CLIENT_SECRET = process.env.DROPBOX_CLIENT_SECRET || 'je5paqlcai1vxhc';
+const REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN || 'L4N3aNJBnM8AAAAAAAAAAX9jprkmTjHaduGuaKzGxtnODQ5UhEzEUIvgUFXQ3uop';
 // ---------------------------------------------------------------------
 
 // Middlewares
