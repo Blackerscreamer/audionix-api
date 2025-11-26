@@ -462,47 +462,27 @@ app.route('/change')
    * temp-link -> returns Dropbox temporary link for playback
    * Accepts query param "id" or "path" (or even ?path=<id> which is interpreted as id)
    */
-
-  app.post("/temp-link", (req, res) => {
-    const { path } = req.body;
-    if (!path) return res.status(400).json({ error: "Missing path" });
-
-    const tempId = Math.random().toString(36).substring(2, 12);
-
-    tempLinks[tempId] = {
-        path,
-        created: Date.now()
-    };
-
-    const fakeUrl = `https://https://audionix-api-2qat.onrender.com/temp/${tempId}`;
-    res.json({ url: fakeUrl });
-});
-
-  
-app.get("/temp/:id", async (req, res) => {
-    const { id } = req.params;
-
-    const entry = tempLinks[id];
-    if (!entry) return res.status(404).json({ error: "Link expired" });
-
-    const itemId = dropboxPaths[entry.path];
-    if (!itemId) return res.status(404).json({ error: "File not found" });
-
+  app.get('/temp-link', async (req, res) => {
     try {
-        const response = await dbx.filesGetTemporaryLink({ path: itemId });
-        const realUrl = response.result.link;
+      if (!dbx || !ACCESS_TOKEN) return res.status(503).json({ error: 'Dropbox-Client noch nicht initialisiert (kein Access Token).' });
 
-        // Link sofort ungültig machen
-        delete tempLinks[id];
+      const { id, path } = req.query;
+      if (!id && !path) return res.status(400).json({ error: 'id oder path query param required' });
 
-        return res.json({ url: realUrl });
+      const resolved = await resolveIdOrPath({ id, path });
+      const resolvedPath = resolved.path;
+      if (!resolvedPath) return res.status(404).json({ error: 'Pfad nicht gefunden' });
 
+      const tl = await dbx.filesGetTemporaryLink({ path: resolvedPath });
+      const link = tl?.result?.link || tl?.link;
+      if (!link) return res.status(500).json({ error: 'Kein temporärer Link erhalten' });
+
+      return res.json({ link, id: id || (resolved.meta ? resolved.meta.id : null) });
     } catch (err) {
-        console.error("Error creating temp link:", err);
-        return res.status(500).json({ error: "Could not create temp link" });
+      console.error('=== TEMPLINK ERROR ===', err?.response?.data || err.message || err);
+      return res.status(500).json({ error: String(err) });
     }
-});
-
+  });
 
   /**
    * download -> streams file through server (fallback)
